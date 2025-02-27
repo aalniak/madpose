@@ -371,13 +371,10 @@ This codebase is inspired by and built upon many research work and opensource pr
 ## Citation
 If you find our work useful in your research, please consider citing our paper:
 ```
-@misc{yu2025madpose,
-      title={Relative Pose Estimation through Affine Corrections of Monocular Depth Priors}, 
-      author={Yifan Yu and Shaohui Liu and Rémi Pautrat and Marc Pollefeys and Viktor Larsson},
-      year={2025},
-      eprint={2501.05446},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2501.05446}, 
+@inproceedings{yu2025madpose,
+    title={Relative Pose Estimation through Affine Corrections of Monocular Depth Priors}, 
+    author={Yifan Yu and Shaohui Liu and Rémi Pautrat and Marc Pollefeys and Viktor Larsson},
+    booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
+    year={2025}
 }
 ```
