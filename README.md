@@ -10,6 +10,9 @@ Note: "**MAD**" is an acronym for "**M**onocular **A**ffine **D**epth".
 **Overview**: Our method takes a pair of images as input, runs off-the-shelf feature matching and monocular depth
 estimation, then jointly estimates the relative pose, scale and shift parameters of the two depth maps, and optionally the focal lengths.
 
+## 📢 News
+- 2025-02-27: Our paper is accepted to CVPR 2025! See you in Nashville, TN!
+  
 ## Evaluation
 We develop three solvers for relative pose estimation that explicitly account for independent affine (scale and shift) ambiguities, tailored for three setups of cameras: calibrated, shared-focal, and unknown focal lengths (two-focal). The solvers are further combined with classic point-based solvers and epipolar constraints in our hybrid RANSAC estimators. Our estimators show consistent improvements over classic point-based methods (e.g. [PoseLib](https://github.com/PoseLib/PoseLib)) and recent two-view reconstruction methods [DUSt3R](https://github.com/naver/dust3r) and [MASt3R](https://github.com/naver/mast3r), across different datasets with different feature matchers and monocular depth estimation models. 
 
