@@ -1,16 +1,6 @@
-# monocular_BA_pipeline.py
-"""
-Depth-aided two-frame pose pipeline + optional bundle-adjustment (BA).
-Key runtime flags
-─────────────────
---input <img_folder>      folder with monocular images
---timestamps <txt>        line-aligned timestamps (same order as images)
---debug N                 process first N pairs then exit
---force_cpu               disable CUDA entirely (sets CUDA_VISIBLE_DEVICES="")
-"""
-
 import sys
 ## Add all paths before any imports
+#sys.path.append('/home/arda/OGAM/UniK3D')
 sys.path.append('/home/arda/OGAM/mast3r')
 import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
@@ -24,12 +14,10 @@ import os
 import time
 import gc
 from scipy.spatial.transform import Rotation as R
-import cv2
-from scipy.optimize import least_squares
-from scipy.spatial.transform import Rotation as Rscipy
-from PIL import Image
+import cv2  # Add OpenCV import
 
 sys.path.append('/home/arda/OGAM/UniK3D')
+from PIL import Image
 print("==============================")
 print("Importing Libraries:")
 import numpy as np
@@ -37,6 +25,7 @@ print("> Numpy imported.")
 
 import torch
 print("> Torch imported.")
+
 
 from unik3d.models import UniK3D
 print("> UniK3D imported.")
@@ -57,485 +46,441 @@ print("> MADPose imported.")
 print("Imports done.")
 print("==============================")
 
-# ------------------------------------------------------------------
-# Early device selection that survives broken CUDA installs
-# ------------------------------------------------------------------
 
-def select_device(force_cpu: bool):
-    if force_cpu:
-        os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # torch will think GPU absent
-        return "cpu"
-    try:
-        # Set CUDA_VISIBLE_DEVICES before importing torch
-        os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # Only use first GPU
-        #import torch
-        if not torch.cuda.is_available():
-            print("[WARN] CUDA not available - falling back to CPU")
-            os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-            return "cpu"
-        try:
-            # Test CUDA device
-            test_tensor = torch.zeros(1).cuda()
-            del test_tensor
-            return "cuda"
-        except RuntimeError as e:
-            print(f"[WARN] CUDA device test failed - falling back to CPU ({e})")
-            os.environ["CUDA_VISIBLE_DEVICES"] = ""
-            return "cpu"
-    except Exception as e:
-        print(f"[WARN] CUDA init failed – falling back to CPU ({e})")
-        os.environ["CUDA_VISIBLE_DEVICES"] = ""
-        return "cpu"
+def get_pose_at_timestamp(timestamps, path_to_poses):
+    #read the gt pose file
+    gt_poses = np.loadtxt(path_to_poses)
+    poses = []
+    for timestamp in timestamps:
+        poses.append(gt_poses[np.argmin(np.abs(gt_poses[:, 0] - timestamp))])
+    return poses
 
-DEVICE = select_device(force_cpu=False)
-print(f"[INFO] Running on {DEVICE.upper()}")
 
-#INTRINSICS FOR M3ED SPOT SEQUENCES
-K_INTR = np.array([[1.11765708e3, 0.,           6.57809477e2],
-                   [0.,           1.22047382e3, 3.67206231e2],
-                   [0.,           0.,           1.]])
+def get_timestamps(path_to_imgs):
+    #Names of the images are numbers, which i need to divide b 10^9 to obtain timestamps
+    timestamps = [int(img_name.split(".")[0]) / 10**8 for img_name in os.listdir(path_to_imgs)]
+    print(timestamps)
+    return timestamps
 
-def _pack(Rws, tws, pts3d):
-    cams = [np.hstack([Rscipy.from_matrix(Rw).as_rotvec(), tw]) for Rw, tw in zip(Rws, tws)]
-    return np.hstack([*cams, pts3d.ravel()])
 
-def _unpack(x, n_cams, n_pts):
-    cams = x[: n_cams * 6].reshape(n_cams, 6)
-    Rws, tws = [], []
-    for cam in cams:
-        rotvec = cam[:3]  # First 3 elements are rotation vector
-        t = cam[3:]      # Last 3 elements are translation
-        Rws.append(Rscipy.from_rotvec(rotvec).as_matrix())
-        tws.append(t)
-    pts3d = x[n_cams * 6:].reshape(n_pts, 3)
-    return Rws, tws, pts3d
-
-def _reproj_res_torch(params, n_cams, n_pts, tracks, K):
-    # Unpack parameters
-    cams = params[:n_cams * 6].view(n_cams, 6)
-    pts3d = params[n_cams * 6:].view(n_pts, 3)
+def get_rotation_and_translation(pose1, pose2):
+    # Extract translation (x, y, z) and quaternion (qx, qy, qz, qw)
+    x1, y1, z1, qx1, qy1, qz1, qw1 = pose1[1], pose1[2], pose1[3], pose1[4], pose1[5], pose1[6], pose1[7]
+    x2, y2, z2, qx2, qy2, qz2, qw2 = pose2[1], pose2[2], pose2[3], pose2[4], pose2[5], pose2[6], pose2[7]
     
-    # Extract camera parameters
-    Rws = []
-    tws = []
-    for i in range(n_cams):
-        rotvec = cams[i, :3]
-        t = cams[i, 3:]
-        Rw = torch.matrix_exp(torch.tensor([[0, -rotvec[2], rotvec[1]],
-                                          [rotvec[2], 0, -rotvec[0]],
-                                          [-rotvec[1], rotvec[0], 0]], device=params.device))
-        Rws.append(Rw)
-        tws.append(t)
     
-    # Camera intrinsics
-    fx, fy = K[0,0], K[1,1]
-    cx, cy = K[0,2], K[1,2]
+    # Convert quaternions to rotation matrices
+    rotation1 = R.from_quat([qx1, qy1, qz1, qw1]).as_matrix()
+    rotation2 = R.from_quat([qx2, qy2, qz2, qw2]).as_matrix()
     
-    # Compute reprojection errors
-    errors = []
-    for j, Xw in enumerate(pts3d):
-        for kf, u, v in tracks[j]:
-            Xc = Rws[kf].T @ (Xw - tws[kf])
-            if Xc[2] <= 1e-4:
-                continue
-            x = fx * Xc[0] / Xc[2] + cx
-            y = fy * Xc[1] / Xc[2] + cy
-            errors.extend([x - u, y - v])
     
-    return torch.stack(errors) if errors else torch.zeros(1, device=params.device)
+    # Compute the relative rotation (rotation2 * rotation1^(-1))
+    relative_rotation = np.dot(rotation2, rotation1.T)
+    
+    # Compute the relative translation
+    translation1 = np.array([x1, y1, z1])
+    translation2 = np.array([x2, y2, z2])
+    
+    # The relative translation is the difference in translations, rotated by the first pose's rotation
+    rotated_translation1 = np.dot(rotation1.T, translation1)
+    relative_translation = translation2 - translation1
 
-def _seed_tracks(R0, t0, R1, t1, mk0, mk1, depth0):
-    # Convert depth0 to numpy if it's a tensor
-    if torch.is_tensor(depth0):
-        depth0 = depth0.cpu().numpy()
-    
-    Xcs = np.linalg.inv(K_INTR) @ np.vstack([mk0.T, np.ones(len(mk0))])
-    Xws = (R0 @ (depth0 * Xcs)).T + t0
-    pts, tracks = [], []
-    for idx, Xw in enumerate(Xws): 
-        pts.append(Xw)
-        tracks.append([(0, *mk0[idx]), (1, *mk1[idx])])
-    return np.asarray(pts), tracks
+    #print the relative rotation and translation
+    return relative_rotation, relative_translation
 
-def ba_two_frame(R, t, mk0, mk1, d0, debug=False):
-    print("BA started.")
-    pts, trk = _seed_tracks(np.eye(3), np.zeros(3), R, t, mk0, mk1, d0)
-    print("Seed tracks done.")
-    if len(trk) < 8:
-        return R, t
-    
-    # Convert to PyTorch tensors
-    device = torch.device('cuda')
-    x0 = torch.tensor(_pack([np.eye(3), R.copy()], [np.zeros(3), t.copy()], pts), 
-                     device=device, dtype=torch.float32, requires_grad=True)
-    K_torch = torch.tensor(K_INTR, device=device, dtype=torch.float32)
-    
-    print("Optimization started.")
-    t0 = time.perf_counter()
-    
-    # Optimization parameters
-    lr = 0.01
-    max_iter = 21
-    optimizer = torch.optim.Adam([x0], lr=lr)
-    
-    try:
-        for i in range(max_iter):
-            optimizer.zero_grad()
-            errors = _reproj_res_torch(x0, 2, len(pts), trk, K_torch)
-            loss = torch.mean(torch.abs(errors))  # L1 loss
-            loss.backward()
-            optimizer.step()
-            
-            if i % 10 == 0:
-                print(f"Iteration {i}, Loss: {loss.item():.6f}")
-            
-            if loss.item() < 1e-4:  # Early stopping
-                break
-                
-        print("Optimization done.")
-    except Exception as e:
-        print(f"Optimization failed: {e}")
-        return R, t
-    
-    if debug:
-        print(f"BA completed in {time.perf_counter()-t0:.3f}s")
-    
-    # Convert back to numpy
-    x0_np = x0.detach().cpu().numpy()
-    Rws, tws, _ = _unpack(x0_np, 2, len(pts))
-    return Rws[1], tws[1]
 
-# ---------------- wrappers for depth & matches ------------------- #
 
-def infer_depth(model, img):
-    arr = np.array(Image.open(img));  ten = torch.as_tensor(arr).permute(2,0,1)
-    return model.infer(rgb=ten, camera=None, normalize=True, rays=None)['depth'].cpu().squeeze()
 
-def match_pts(model, img0, img1, device, max_m=7000):
-    ims = load_images([img0, img1], size=1280)
-    out = inference([tuple(ims)], model, device, batch_size=1, verbose=False)
-    d1, d2 = out['pred1']['desc'].squeeze(0), out['pred2']['desc'].squeeze(0)
-    mk0, mk1 = fast_reciprocal_NNs(d1, d2, subsample_or_initxy1=8, device=device, dist='dot')
-    if len(mk0) > max_m:
-        sel = np.random.choice(len(mk0), max_m, replace=False)
-        mk0, mk1 = mk0[sel], mk1[sel]
-    return mk0, mk1
-
-# ---------------- main pipeline ---------------------------------- #
-
-def run_unik3d_stage(args, img_path0, img_path1):
-    """Stage 1: Depth estimation using UniK3D"""
-    print("\n=== Stage 1: Depth Estimation (UniK3D) ===")
-    version = args.config_file.split("/")[-1].split(".")[0]
-    name = f"unik3d-{version}"
-    model = UniK3D.from_pretrained(f"lpiccinelli/{name}")
-    print("> UniK3D loaded.")
-    model.resolution_level = args.resolution_level
-    model.interpolation_mode = args.interpolation_mode
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = model.to(device).eval()
-
-    # Process first image
-    args_single = argparse.Namespace(**vars(args))
-    args_single.input = img_path0
-    depth_map0 = infer_depth(model, img_path0)
-    depth_map0 = depth_map0.cpu().squeeze()
-    print("Depth map 0 mean: ", depth_map0.mean())
+def save(rgb, outputs, name, base_path, save_map=False, save_pointcloud=False):
+    os.makedirs(base_path, exist_ok=True)
+    depth = outputs["depth"]
+    rays = outputs["rays"]
+    points = outputs["points"]
+    depth = depth.cpu().numpy()
+    #take the average of the depth map
     
-    # Process second image
-    args_single.input = img_path1
-    depth_map1 = infer_depth(model, img_path1)
-    depth_map1 = depth_map1.cpu().squeeze()
-    print("Depth map 1 mean: ", depth_map1.mean())
-    
-    print("> Depth maps inferred.")
-    del model 
-    gc.collect()
-    torch.cuda.empty_cache()
-    print("> UniK3D deleted to free VRAM.")
-    print("=== Depth Estimation Complete ===\n")
-    
-    return depth_map0, depth_map1
+    rays = ((rays + 1) * 127.5).clip(0, 255)
+    if save_map:
+        np.save(os.path.join(base_path, f"{name}_depth.npy"), depth.squeeze())
 
-def run_mast3r_stage(args, img_path0, img_path1):
-    """Stage 2: Point Matching using MASt3R"""
-    print("\n=== Stage 2: Point Matching (MASt3R) ===")
-    device = 'cuda'
-    model_name = "naver/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric"
-    print("> MASt3R loaded.")
-    
-    mast3r_model = AsymmetricMASt3R.from_pretrained(model_name).to(device)
-    
-    # Load and process images
-    images = load_images([img_path0, img_path1], size=1280)
-    output = inference([tuple(images)], mast3r_model, device, batch_size=1, verbose=False)
 
-    # Extract predictions
-    view1, pred1 = output['view1'], output['pred1']
-    view2, pred2 = output['view2'], output['pred2']
-    desc1, desc2 = pred1['desc'].squeeze(0).detach(), pred2['desc'].squeeze(0).detach()
+def infer(model, args):
+    rgb = np.array(Image.open(args.input))
+    rgb_torch = torch.from_numpy(rgb).permute(2, 0, 1)
+    camera = None
+    camera_path = args.camera_path
+    if camera_path is not None:
+        with open(camera_path, "r") as f:
+            camera_dict = json.load(f)
+        params = torch.tensor(camera_dict["params"])
+        name = camera_dict["name"]
+        assert name in ["Fisheye624", "Spherical", "OPENCV", "Pinhole", "MEI"]
+        camera = eval(name)(params=params)
+    outputs = model.infer(rgb=rgb_torch, camera=camera, normalize=True, rays=None)
+    name = args.input.split("/")[-1].split(".")[0]
+    #save(rgb_torch, outputs, name=name, base_path=args.output, save_map=args.save, save_pointcloud=args.save_ply)
+    return outputs
+
+
+def draw_camera(ax, R, t, color='b', label='Camera', scale=0.05):
+    origin = t
+    # Camera axes (frustum-style visualization)
+    x_axis = R[:, 0] * scale
+    y_axis = R[:, 1] * scale
+    z_axis = R[:, 2] * scale
     
-    # Get confidence scores
-    conf1 = pred1['conf'].squeeze(0).detach() if 'conf' in pred1 else None
-    conf2 = pred2['conf'].squeeze(0).detach() if 'conf' in pred2 else None
+    ax.quiver(*origin, *x_axis, color='r')
+    ax.quiver(*origin, *y_axis, color='g')
+    ax.quiver(*origin, *z_axis, color='b')
+    ax.text(*origin, label, color=color)
 
-    # Find matches
-    matches_im0, matches_im1 = fast_reciprocal_NNs(desc1, desc2, subsample_or_initxy1=8,
-                                                   device=device, dist='dot', block_size=2**13)
-    num_matches = matches_im0.shape[0]
-    print("Number of matches from Mast3R point matching: ", num_matches)
-    
-    # Get confidence scores for matches
-    if conf1 is not None and conf2 is not None:
-        # Get confidence scores for matched points
-        conf_scores = torch.min(conf1[matches_im0[:, 1], matches_im0[:, 0]], 
-                              conf2[matches_im1[:, 1], matches_im1[:, 0]])
-        
-        # Sort by confidence
-        sorted_indices = torch.argsort(conf_scores, descending=True)
-        matches_im0 = matches_im0[sorted_indices]
-        matches_im1 = matches_im1[sorted_indices]
-        
-        # Take top 2000 matches for MADPose
-        max_matches_madpose = 2000
-        matches_im0_madpose = matches_im0[:max_matches_madpose]
-        matches_im1_madpose = matches_im1[:max_matches_madpose]
-        print(f"Selected top {max_matches_madpose} matches for MADPose based on confidence")
-        
-        # Take top 200 matches for bundle adjustment
-        max_matches_ba = 200
-        matches_im0_ba = matches_im0[:max_matches_ba]
-        matches_im1_ba = matches_im1[:max_matches_ba]
-        print(f"Selected top {max_matches_ba} matches for bundle adjustment based on confidence")
-    else:
-        # If no confidence scores, randomly sample
-        max_matches_madpose = 2000
-        max_matches_ba = 200
-        if num_matches > max_matches_madpose:
-            indices = np.random.choice(num_matches, max_matches_madpose, replace=False)
-            matches_im0_madpose = matches_im0[indices]
-            matches_im1_madpose = matches_im1[indices]
-            print(f"Randomly selected {max_matches_madpose} matches for MADPose (no confidence scores available)")
-            
-            indices = np.random.choice(num_matches, max_matches_ba, replace=False)
-            matches_im0_ba = matches_im0[indices]
-            matches_im1_ba = matches_im1[indices]
-            print(f"Randomly selected {max_matches_ba} matches for bundle adjustment (no confidence scores available)")
-    
-    # Filter valid matches for MADPose
-    H0, W0 = view1['true_shape'][0]
-    valid_matches_im0 = (matches_im0_madpose[:, 0] >= 3) & (matches_im0_madpose[:, 0] < int(W0) - 3) & (
-        matches_im0_madpose[:, 1] >= 3) & (matches_im0_madpose[:, 1] < int(H0) - 3)
-
-    H1, W1 = view2['true_shape'][0]
-    valid_matches_im1 = (matches_im1_madpose[:, 0] >= 3) & (matches_im1_madpose[:, 0] < int(W1) - 3) & (
-        matches_im1_madpose[:, 1] >= 3) & (matches_im1_madpose[:, 1] < int(H1) - 3)
-
-    valid_matches = valid_matches_im0 & valid_matches_im1
-    matches_im0_madpose, matches_im1_madpose = matches_im0_madpose[valid_matches], matches_im1_madpose[valid_matches]
-
-    print("> Point matching done.")
-    del mast3r_model
-    gc.collect()
-    torch.cuda.empty_cache()
-    print("> MASt3R deleted to free VRAM.")
-    print("=== Point Matching Complete ===\n")
-    
-    return matches_im0_madpose, matches_im1_madpose, matches_im0_ba, matches_im1_ba
-
-def run_madpose_stage(args, matches_im0, matches_im1, matches_im0_ba, matches_im1_ba, depth_map0, depth_map1, pair_index):
-    """Stage 3: Pose Estimation using MADPose"""
-    print("\n=== Stage 3: Pose Estimation (MADPose) ===")
-    
-    # Prepare data for MADPose
-    mkpts0 = matches_im0
-    mkpts1 = matches_im1
-    depth_map0_cpu = depth_map0.cpu().squeeze()
-    depth_map1_cpu = depth_map1.cpu().squeeze()
-    
-    # Extract x and y coordinates
-    x0, y0 = mkpts0[:, 0], mkpts0[:, 1]
-    x1, y1 = mkpts1[:, 0], mkpts1[:, 1]
-    
-    # Get depth values using integer coordinates
-    depth0 = depth_map0_cpu[y0.astype(np.int64), x0.astype(np.int64)]
-    depth1 = depth_map1_cpu[y1.astype(np.int64), x1.astype(np.int64)]
-
-    # Configure MADPose options
-    options = madpose.HybridLORansacOptions()
-    options.min_num_iterations = 100
-    options.max_num_iterations = 2500
-    options.success_probability = 0.9999
-    options.random_seed = 0
-    options.final_least_squares = True
-    options.threshold_multiplier = 5.0
-    options.num_lo_steps = 6
-    reproj_pix_thres = 0.5
-    epipolar_pix_thres = 0.5
-    epipolar_weight = 0.5
-    options.squared_inlier_thresholds = [reproj_pix_thres ** 2, epipolar_pix_thres ** 2]
-    options.data_type_weights = [1.0, epipolar_weight]
-
-    est_config = madpose.EstimatorConfig()
-    est_config.min_depth_constraint = False
-    est_config.use_shift = False
-    est_config.ceres_num_threads = 8
-
-    # Format inputs for MADPose
-    x0_madpose = [np.array([[x], [y]], dtype=np.float64) for x, y in zip(x0, y0)]
-    x1_madpose = [np.array([[x], [y]], dtype=np.float64) for x, y in zip(x1, y1)]
-    depth0 = [float(d) for d in depth0]
-    depth1 = [float(d) for d in depth1]
-    min_depth = np.array([[depth_map0_cpu.min()], [depth_map1_cpu.min()]], dtype=np.float64)
-
-    # Estimate pose
-    pose, stats = madpose.HybridEstimatePoseScaleOffset(
-                  x0_madpose, x1_madpose, 
-                  depth0, depth1,
-                  min_depth, 
-                  K_INTR, K_INTR, options, est_config
-              )
-    
-    R_est, t_est = pose.R(), pose.t()
-    
-    # Optional bundle adjustment - only after pair 12
-    if not args.no_ba and pair_index >= 12:
-        # Use top 200 high-confidence matches for bundle adjustment
-        print(f"Using top {len(matches_im0_ba)} high-confidence matches for bundle adjustment")
-        
-        # Get depths for BA matches
-        depth0_ba = depth_map0_cpu[matches_im0_ba[:, 1].astype(np.int64), 
-                                 matches_im0_ba[:, 0].astype(np.int64)]
-        
-        R_est, t_est = ba_two_frame(R_est, t_est, matches_im0_ba, matches_im1_ba, 
-                                  depth0_ba, args.debug)
-    elif not args.no_ba:
-        print(f"Skipping bundle adjustment for pair {pair_index} (before pair 12)")
-    
-    print("> Pose estimation complete.")
-    print(f"Number of inliers: {stats.best_num_inliers}")
-    print("=== Pose Estimation Complete ===\n")
-    
-    return R_est, t_est, stats
-
-def get_line_of_timestamp(timestamp):
-    #read the timestamps.txt file
-    #gt_modified.txt has the ts, x, y, z, qx, qy, qz, qw
-    timestamps = np.loadtxt("gt_modified.txt")[:,0]
-    #get the line of the timestamp that is closer to the input timestamp
-    line = np.argmin(np.abs(timestamps - timestamp))
-    timestamps = np.loadtxt("gt_modified.txt")
-    return timestamps[line]
-
-def pose_line_to_Twc(line):
-    #i have a list for these items, so i need to unpack them
-    ts, x, y, z, qx, qy, qz, qw = line
-    R_wc = R.from_quat([qx, qy, qz, qw]).as_matrix()
-    t_wc = np.array([x, y, z])
-    Twc = np.eye(4)
-    Twc[:3, :3] = R_wc
-    Twc[:3, 3] = t_wc
-    return ts, Twc
-
-def relative_T12(Twc1, Twc2):
-    Rwc1, twc1 = Twc1[:3,:3], Twc1[:3,3]
-    Rwc2, twc2 = Twc2[:3,:3], Twc2[:3,3]
-    R12 = Rwc1.T @ Rwc2
-    t12 = Rwc1.T @ (twc2 - twc1)
-    return R12, t12
 
 def run(args):
-    """Main pipeline that runs all stages sequentially"""
-    # Create output directory if it doesn't exist
-    output_dir = os.path.dirname(args.output)
-    if output_dir:  # Only create directory if path contains a directory
-        os.makedirs(output_dir, exist_ok=True)
+        timestamps = np.loadtxt("timestamps_f.txt")
+        unik3d = False
+        mast3r = False
+        
+        for i in range(len(timestamps)-1):
+            timestamps = np.loadtxt("timestamps_f.txt")
+            time1 = timestamps[i]
+            time2 = timestamps[i+1]
+            
+            img_path0 = f"../mast3r/asd/{int(round(timestamps[i]*10))}0000000.png"
+            img_path1 = f"../mast3r/asd/{int(round(timestamps[i+1]*10))}0000000.png"
+            
+            #these are float numbers, such as 0.4, which i want to multiply with 10^8 for naming the images
+            
     
-    # Load timestamps
-    timestamps = np.loadtxt(args.timestamps)
-    print(f"Loaded {len(timestamps)} timestamps")
-    
-    # Find the starting index if start_time is specified
-    start_idx = 0
-    if args.start_time is not None:
-        # Find the closest timestamp to start_time
-        start_idx = np.argmin(np.abs(timestamps - args.start_time))
-        print(f"Starting from timestamp {timestamps[start_idx]:.6f} (closest to {args.start_time:.6f})")
-    
-    # Process each consecutive pair
-    for i in range(start_idx, len(timestamps)-1):
-        if args.debug and i >= args.debug:
-            break
+            print("Depth estimation starts")
+            if unik3d and 'model' in locals():
+                print("Already loaded UniK3D.")
+            else:
+                version = args.config_file.split("/")[-1].split(".")[0]
+                name = f"unik3d-{version}"
+                model = UniK3D.from_pretrained(f"lpiccinelli/{name}")
+                print("> UniK3D loaded.")
+                model.resolution_level = args.resolution_level
+                model.interpolation_mode = args.interpolation_mode
+                unik3d = True
+
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                model = model.to(device).eval()
+
+
+            #timestamps = np.loadtxt("timestamps_f.txt")
+
+            if os.path.isdir(args.input):
+                # Loop through all image files in the folder
+                valid_exts = (".jpg", ".jpeg", ".png", ".bmp")
+                image_paths = [os.path.join(args.input, fname) for fname in sorted(os.listdir(args.input))
+                               if fname.lower().endswith(valid_exts)]
+
+
+                
+                args_single = argparse.Namespace(**vars(args))  # Create a copy of args
+                args_single.input = img_path0
+                depth_map0 = infer(model, args_single)['depth']
+                #bro depth_map0 is a tensor, gimme the mean of the depth map
+                depth_map0 = depth_map0.cpu().squeeze()
+                #print the mean of the depth map
+                print("Depth map 0 mean: ", depth_map0.mean())
+                args_single.input = img_path1
+                depth_map1 = infer(model, args_single)['depth']
+                #bro depth_map1 is a tensor, gimme the mean of the depth map
+                depth_map1 = depth_map1.cpu().squeeze()
+                #print the mean of the depth map
+                print("Depth map 1 mean: ", depth_map1.mean())
+
+                
             
-        time1 = timestamps[i]
-        time2 = timestamps[i+1]
-        
-        print(f"\nProcessing pair {i+1}/{len(timestamps)-1}")
-        print(f"Timestamps: {time1:.6f} -> {time2:.6f}")
-        
-        img_path0 = f"{args.input}/{int(round(time1*10))}0000000.png"
-        img_path1 = f"{args.input}/{int(round(time2*10))}0000000.png"
-        
-        if not os.path.exists(img_path0) or not os.path.exists(img_path1):
-            print(f"Skipping pair {i+1}: Image files not found")
-            continue
-        
-        try:
-            # Stage 1: Depth Estimation
-            depth_map0, depth_map1 = run_unik3d_stage(args, img_path0, img_path1)
-            
-            # Stage 2: Point Matching
-            matches_im0, matches_im1, matches_im0_ba, matches_im1_ba = run_mast3r_stage(args, img_path0, img_path1)
-            
-            # Stage 3: Pose Estimation
-            R_est, t_est, stats = run_madpose_stage(args, matches_im0, matches_im1, matches_im0_ba, matches_im1_ba, 
-                                                  depth_map0, depth_map1, i+1)
-            
-            # Get ground truth poses
-            ts1, Twc1 = pose_line_to_Twc(get_line_of_timestamp(time1))
-            ts2, Twc2 = pose_line_to_Twc(get_line_of_timestamp(time2))
-            R_gt, t_gt = relative_T12(Twc2, Twc1)
-            
-            # Save results in the requested format
-            with open(args.output, 'a') as log:
-                log.write(f"From {time1:.1f} to {time2:.1f}\n")
-                log.write("Estimated rotation:\n")
-                log.write(f"{R_est}\n")
-                log.write("GT rotation:\n")
-                log.write(f"{R_gt}\n")
-                log.write("Estimated translation:\n")
-                log.write(f"{t_est}\n")
-                log.write("GT translation:\n")
-                log.write(f"{t_gt}\n")
-                log.write(f"Number of matches: {len(matches_im0)}\n")
-                log.write(f"Number of inliers: {stats.best_num_inliers}\n")
-                log.write("==============================\n\n")
-            
-            print(f"Completed processing pair {i+1}")
+            print("> Depth maps inferred.")
+            del model 
+            gc.collect()
+            torch.cuda.empty_cache()
+            print("> UniK3D deleted to free VRAM.")
+            print("Depth estimation done.")
             print("==============================")
+
+
+            ''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+            '''POINT MATCHING PART: TWO IMAGES' POINT MATCHING TAKES PLACE HERE'''
+            ''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+            print("Point matching starts")
+            device = 'cuda'
+            schedule = 'cosine'
+            lr = 0.01
+            niter = 1000
+            model_name = "naver/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric"
+            print("> MASt3R loaded.")
+            # you can put the path to a local checkpoint in model_name if needed
+            if mast3r and 'mast3r_model' in locals():
+                print("Already loaded MASt3R.")
+            else:
+                mast3r_model = AsymmetricMASt3R.from_pretrained(model_name).to(device)
+                mast3r = True
+            images = load_images([img_path0, img_path1], size=1280)
+            output = inference([tuple(images)], mast3r_model, device, batch_size=1, verbose=False)
+
+            # at this stage, you have the raw dust3r predictions
+            view1, pred1 = output['view1'], output['pred1']
+            view2, pred2 = output['view2'], output['pred2']
+
+            desc1, desc2 = pred1['desc'].squeeze(0).detach(), pred2['desc'].squeeze(0).detach()
+
+            # find 2D-2D matches between the two images
+            matches_im0, matches_im1 = fast_reciprocal_NNs(desc1, desc2, subsample_or_initxy1=8,
+                                                           device=device, dist='dot', block_size=2**13)
+            num_matches = matches_im0.shape[0]
+            print("Number of matches from Mast3R point matching: ", num_matches)
+            max_matches = 7000
+
+            # Take first max_matches matches randomly
+            if num_matches > max_matches:
+                indices = np.random.choice(num_matches, max_matches, replace=False)
+                matches_im0 = matches_im0[indices]
+                matches_im1 = matches_im1[indices]
+                num_matches = max_matches
+            print("Number of matches after taking first max_matches matches randomly: ", num_matches)
+
+            print("> Point matching done.")
+            # ignore small border around the edge
+            H0, W0 = view1['true_shape'][0]
+            valid_matches_im0 = (matches_im0[:, 0] >= 3) & (matches_im0[:, 0] < int(W0) - 3) & (
+                matches_im0[:, 1] >= 3) & (matches_im0[:, 1] < int(H0) - 3)
+
+            H1, W1 = view2['true_shape'][0]
+            valid_matches_im1 = (matches_im1[:, 0] >= 3) & (matches_im1[:, 0] < int(W1) - 3) & (
+                matches_im1[:, 1] >= 3) & (matches_im1[:, 1] < int(H1) - 3)
+
+            valid_matches = valid_matches_im0 & valid_matches_im1
+            matches_im0, matches_im1 = matches_im0[valid_matches], matches_im1[valid_matches]
+
+            print("> Depth correspondances found.")
+            del mast3r_model
+            gc.collect()
+            torch.cuda.empty_cache()
+            print("> MASt3R deleted to free VRAM.")
+            print("==============================")
+            #create two variables for match pixels
+
+            #reverse x and y
+            mkpts0 = matches_im0#[:, [1, 0]]
+            mkpts1 = matches_im1#[:, [1, 0]]
+
+
+            #obtain depth values for match pixels
+            depth_map0_cpu = depth_map0.cpu().squeeze() 
+            #print matches_im0's max value in y
+            depth_map1_cpu = depth_map1.cpu().squeeze() 
+
+            depth0 = depth_map0_cpu[mkpts0[:, 1], mkpts0[:, 0]]
+            depth1 = depth_map1_cpu[mkpts1[:, 1], mkpts1[:, 0]]
+
+            # visualize a few matches
+
+
+            # n_viz = 25
+            # num_matches = matches_im0.shape[0]
+            # match_idx_to_viz = np.round(np.linspace(0, num_matches - 1, n_viz)).astype(int)
+            viz_matches_im0, viz_matches_im1 = matches_im0, matches_im1
+
+            image_mean = torch.as_tensor([0.5, 0.5, 0.5], device='cpu').reshape(1, 3, 1, 1)
+            image_std = torch.as_tensor([0.5, 0.5, 0.5], device='cpu').reshape(1, 3, 1, 1)
+
+            viz_imgs = []
+            for k, view in enumerate([view1, view2]):
+                rgb_tensor = view['img'] * image_std + image_mean
+                viz_imgs.append(rgb_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy())
+
+            H0, W0, H1, W1 = *viz_imgs[0].shape[:2], *viz_imgs[1].shape[:2]
+            img0 = np.pad(viz_imgs[0], ((0, max(H1 - H0, 0)), (0, 0), (0, 0)), 'constant', constant_values=0)
+            img1 = np.pad(viz_imgs[1], ((0, max(H0 - H1, 0)), (0, 0), (0, 0)), 'constant', constant_values=0)
+            img = np.concatenate((img0, img1), axis=1)
+            #pl.figure()
+            #pl.imshow(img)
+            cmap = pl.get_cmap('jet')
+            #for i in range(len(viz_matches_im0)):
+             #   (x0, y0), (x1, y1) = viz_matches_im0[i].T, viz_matches_im1[i].T
+                # pl.plot([x0, x1 + W0], [y0, y1], '-+', color=cmap(i / (n_viz - 1)), scalex=False, scaley=False)
+              #  colors = cmap(i / (len(viz_matches_im0) - 1))
+                #plt.scatter(x0, y0, c=[colors], s=10, label=f'Match {i+1}')
+                #plt.scatter(x1 + W0, y1, c=[colors], s=10)
+                # plt.plot([x0, x1 + W0], [y0, y1], color=colors, linewidth=0.5)
+            #pl.show(block=True)
+
+
+
+            ''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+            '''POSE ESTIMATION PART: TWO IMAGES' POSE ESTIMATION TAKES PLACE HERE'''
+            ''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+            print("Pose estimation starts")
+            options = madpose.HybridLORansacOptions()
+            options.min_num_iterations = 100
+            options.max_num_iterations = 2500
+            options.success_probability = 0.9999
+            options.random_seed = 0 # for reproducibility
+            options.final_least_squares = True
+            options.threshold_multiplier = 5.0
+            options.num_lo_steps = 6
+            # squared px thresholds for reprojection error and epipolar error
+            reproj_pix_thres = 0.5
+            epipolar_pix_thres = 0.5
+            epipolar_weight = 0.5
+            options.squared_inlier_thresholds = [reproj_pix_thres ** 2, epipolar_pix_thres ** 2]
+            # weight when scoring for the two types of errors
+            options.data_type_weights = [1.0, epipolar_weight]
+
+            est_config = madpose.EstimatorConfig()
+            # if enabled, the input min_depth values are guaranteed to be positive with the estimated depth offsets (shifts), default: True
+            est_config.min_depth_constraint = False
+            # if disabled, will model the depth with only scale (only applicable to the calibrated camera case)
+            est_config.use_shift = False
+            # best set to the number of PHYSICAL CPU cores
+            est_config.ceres_num_threads = 8
+
+            #intrinsics: [1058.1744780806393, 1058.4470113647467, 675.570437960496, 334.6606098486689]  
+            #generate K0 and K1
+            K0 = np.array([[1.11765708e+03, 0.00000000e+00, 6.57809477e+02],
+                           [0.00000000e+00, 1.22047382e+03, 3.67206231e+02],
+                           [0.00000000e+00, 0.00000000e+00, 1.00000000e+00]])
+            K1 = np.array([[1.11765708e+03, 0.00000000e+00, 6.57809477e+02],
+                           [0.00000000e+00, 1.22047382e+03, 3.67206231e+02],
+                           [0.00000000e+00, 0.00000000e+00, 1.00000000e+00]])
+            #make mkpts0 and mkpts1 lists of np arrays
+            mkpts0 = mkpts0.tolist()
+            mkpts1 = mkpts1.tolist()
+
+            #make depth0 and depth1 lists of floats
+            depth0 = depth0.tolist()
+            depth1 = depth1.tolist()
+
+
+
+            # Format inputs correctly for HybridEstimatePoseScaleOffset
+            x0 = [np.array([[x], [y]], dtype=np.float64) for x, y in mkpts0]
+            x1 = [np.array([[x], [y]], dtype=np.float64) for x, y in mkpts1]
+            depth0 = [float(d) for d in depth0]
+            depth1 = [float(d) for d in depth1]
+            min_depth = np.array([[depth_map0_cpu.min()], [depth_map1_cpu.min()]], dtype=np.float64)
+
+            pose, stats = madpose.HybridEstimatePoseScaleOffset(
+                          x0, x1, 
+                          depth0, depth1,
+                          min_depth, 
+                          K0, K1, options, est_config
+                      )
+            # rotation and translation of the estimated pose
+            R_est, t_est = pose.R(), pose.t()
+            # scale and offsets of the affine corrected depth maps
+            s_est, o0_est, o1_est = pose.scale, pose.offset0, pose.offset1
+            print(">>RANSAC Inliers: ", stats.best_num_inliers)
+            print(">>RANSAC Inlier Ratio: ", stats.inlier_ratios)
             
-        except Exception as e:
-            print(f"Error processing pair {i+1}: {str(e)}")
-            continue
-        
-        # Clear GPU memory after each pair
-        torch.cuda.empty_cache()
-        gc.collect()
+            R_est, t_est = pose.R(), pose.t()
+            s_est, o0_est, o1_est = pose.scale, pose.offset0, pose.offset1
 
-# ---------------- CLI ------------------------------------------- #
+            R_est, t_est = pose.R(), pose.t()
+            s_est, o0_est, o1_est = pose.scale, pose.offset0, pose.offset1
+            print("> Estimated pose: ", pose)
+            print("> Estimated scale: ", s_est)
+            print("> Estimated offset0: ", o0_est)
+            print("> Estimated offset1: ", o1_est)
+            print("> Estimated rotation: ", R_est)
+            print("> Estimated translation: ", t_est)
+            print("==============================")
+            #write the estimated rotation and translation into results.txt
+            
+            #get timestamps
+            def get_line_of_timestamp(timestamp):
+                #read the timestamps.txt file
+                #gt_modified.txt has the ts, x, y, z, qx, qy, qz, qw
+                timestamps = np.loadtxt("gt_modified.txt")[:,0]
+                #get the line of the timestamp that is closer to the input timestamp
+                line = np.argmin(np.abs(timestamps - timestamp))
+                timestamps  = np.loadtxt("gt_modified.txt")
+                #print  the entire line 
+                return timestamps[line]
 
-# -------------------- CLI ------------------------------------------ #
+            def pose_line_to_Twc(line):
+                #i have a list for these items, so i need to unpack them
+                ts, x, y, z, qx, qy, qz, qw = line
+                R_wc = R.from_quat([qx, qy, qz, qw]).as_matrix()
+                t_wc = np.array([x, y, z])
+                Twc = np.eye(4)
+                Twc[:3, :3] = R_wc
+                Twc[:3, 3] = t_wc
+                return ts, Twc
+
+            def relative_T12(Twc1, Twc2):
+                Rwc1, twc1 = Twc1[:3,:3], Twc1[:3,3]
+                Rwc2, twc2 = Twc2[:3,:3], Twc2[:3,3]
+                R12 = Rwc1.T @ Rwc2
+                t12 = Rwc1.T @ (twc2 - twc1)
+                return R12, t12
+
+
+            timestamps = np.loadtxt("timestamps_f.txt")
+            print(i)
+            print(timestamps[i])
+            ts1, Twc1 = pose_line_to_Twc(get_line_of_timestamp(timestamps[i]))
+            ts2, Twc2 = pose_line_to_Twc(get_line_of_timestamp(timestamps[i+1]))
+            R12, t12 = relative_T12(Twc1, Twc2)
+            print("> GT rotation: ", R12)
+            print("> GT translation: ", t12)
+            with open("results.txt", "a") as f:
+                f.write(f"From {time1} to {time2}\n")
+                f.write(f"Estimated rotation: {R_est}\n")
+                f.write(f"GT rotation: {R12}\n")
+                f.write(f"Estimated translation: {t_est}\n")
+                f.write(f"GT translation: {t12}\n")
+                f.write(f"Number of matches: {num_matches}\n")
+                f.write(f"Number of inliers: {stats.best_num_inliers}\n")
+                f.write("==============================\n")
+            f.close()
+            # --- Assume Previous Pose is Identity (Origin) ---
+            R_prev = np.eye(3)
+            t_prev = np.zeros(3)
+
+            # --- Visualize ---
+            fig = plt.figure()
+            ax = fig.add_subplot(111, projection='3d')
+
+            # Previous Camera Pose
+            draw_camera(ax, R_prev, t_prev, color='orange', label='Before')
+
+            # Estimated (New) Camera Pose
+            draw_camera(ax, R_est, t_est, color='blue', label='After')
+
+            # Axes limits
+            ax.set_xlim([-0.3, 0.3])
+            ax.set_ylim([-0.3, 0.3])
+            ax.set_zlim([-0.4, 0.1])
+
+            ax.set_xlabel('X')
+            ax.set_ylabel('Y')
+            ax.set_zlabel('Z')
+            ax.set_title('Camera Pose Transformation')
+            #plt.show()
+    
+
+
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--input', default="../mast3r/asd", help='folder with images')
-    ap.add_argument('--timestamps', default='timestamps_f.txt', help='timestamps txt')
-    ap.add_argument('--config-file', default='./configs/eval/vitl.json')
-    ap.add_argument('--output', default='results_BA.txt')
-    ap.add_argument('--debug', type=int, default=0, help='0=full, N=run N pairs then exit')
-    ap.add_argument('--no_ba', default=True, help='skip further BA stage entirely')
-    ap.add_argument('--resolution_level', type=int, default=0, help='resolution level for UniK3D')
-    ap.add_argument('--interpolation_mode', type=str, default='bilinear', help='interpolation mode for UniK3D')
-    ap.add_argument('--start_time', type=float, default=4.4, help='start processing from this timestamp')
-    args = ap.parse_args()
-    run(args)
+    #timestamps_f.txt has the timestamps of the images
+    
+        #get the two images
+    ''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+    '''DEPTH ESTIMATION PART: TWO IMAGES' DEPTH ESTIMATION TAKES PLACE HERE'''
+    ''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+    parser = argparse.ArgumentParser(description='Inference script', conflict_handler='resolve')
+    parser.add_argument("--input", type=str, default = "../mast3r/imgs", help="Path to input image or directory.")
+    parser.add_argument("--output", type=str, default = "../mast3r/out", help="Path to output directory.")
+    parser.add_argument("--config-file", type=str, default="./configs/eval/vitl.json", help="Path to config file.")
+    parser.add_argument("--camera-path", type=str, default=None, help="Path to camera parameters JSON file.")
+    parser.add_argument("--save", action="store_true", help="Save outputs as (colorized) PNG.")
+    parser.add_argument("--save-ply", action="store_true", help="Save pointcloud as PLY.")
+    parser.add_argument("--resolution-level", type=int, default=9, help="Resolution level in [0,10).", choices=list(range(10)))
+    parser.add_argument("--interpolation-mode", type=str, default="bilinear", help="Output interpolation.", choices=["nearest", "nearest-exact", "bilinear"])
+    args = parser.parse_args()
+    print("Parsing done.")
+    print("==============================")
+    run(args)    
